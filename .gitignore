@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+.checks/
+.env
+.env.*
+!.env.example
+.venv/
+/.kibitz/
+/runtime/
+/state/
+/captures/
+*.log
