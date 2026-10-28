@@ -59,7 +59,8 @@ def main():
         nonce_file.write_text(marker)
         worker_args = argparse.Namespace(agent='main', session_key='kibitz-check-' + unique,
             workspace=workspace, model=args.model, interval=5, frames=2, display=1,
-            openclaw=kibitz.shutil.which('openclaw') or 'openclaw', timeout=120, no_notify=True)
+            openclaw=kibitz.shutil.which('openclaw') or 'openclaw', timeout=120,
+            no_notify=True, no_speech=True, voice=kibitz.DEFAULT_VOICE)
         worker = kibitz.Worker(worker_args, home)
         common = ('这是用户授权的内部集成验证，不是真人新消息，不播报、不通知、不改变任务。'
                   '保持 JSON 输出约定，comment 必须为空；使用文件工具直接编辑，不用脚本搬运记忆。')

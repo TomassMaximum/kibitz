@@ -27,6 +27,7 @@ SESSION_PROMPT = SCRIPT.parent.parent / 'references' / 'session.md'
 DEFAULT_CONTEXT = SCRIPT.parent.parent / 'references' / 'context.md'
 DEFAULT_MODEL = 'deepseek/deepseek-v4-flash'
 DEFAULT_WORKSPACE = Path('~/.openclaw/workspace').expanduser()
+DEFAULT_VOICE = 'Tingting'
 
 
 def now():
@@ -131,6 +132,26 @@ def notification_command(text):
             '-e', 'end run', text, 'Kibitz · 小爪']
 
 
+def speech_command(text, voice=DEFAULT_VOICE):
+    return ['/usr/bin/say', '-v', voice, '--', text]
+
+
+def present_comment(text, runner, *, no_speech=False, voice=DEFAULT_VOICE):
+    """Deliver the same comment to notification and local speech, without a queue."""
+    result = dict(notification_error=None, speech_error=None)
+    channels = [('notification_error', notification_command(text), 10)]
+    if not no_speech:
+        channels.append(('speech_error', speech_command(text, voice), 30))
+    for field, argv, timeout in channels:
+        try:
+            runner(argv, timeout=timeout)
+        except InterruptedError:
+            raise
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            result[field] = str(error)
+    return result
+
+
 class Worker:
     def __init__(self, args, home):
         self.args, self.home = args, home
@@ -143,11 +164,13 @@ class Worker:
         self.state = dict(running=True, pid=os.getpid(), started_at=now(),
                           model=args.model, interval=args.interval, display=args.display,
                           frames=args.frames, timeout=args.timeout, no_notify=args.no_notify,
+                          no_speech=args.no_speech, voice=args.voice,
+                          speech_enabled=not (args.no_notify or args.no_speech),
                           backend='openclaw-agent', agent=args.agent,
                           session_key=session_key(args.agent, args.session_key),
                           workspace=str(args.workspace),
                           cycles=0, comments=0, failures=0, summary='', last_comment='',
-                          last_error=None, notification_error=None)
+                          last_error=None, notification_error=None, speech_error=None)
 
     def terminate_child(self, graceful=False):
         if self.child and self.child.poll() is None:
@@ -250,7 +273,8 @@ class Worker:
             handle.write(json.dumps(dict(time=now(), **event), ensure_ascii=False) + '\n')
 
     def notify(self, text):
-        self.command(notification_command(text), timeout=10)
+        self.state.update(present_comment(text, self.command,
+                                          no_speech=self.args.no_speech, voice=self.args.voice))
 
     def cycle(self, folder):
         started = time.monotonic()
@@ -287,7 +311,7 @@ class Worker:
         self.acknowledge_notes(notes)
         model_ms = round((time.monotonic() - model_started) * 1000)
         self.state.update(summary=reply['summary'], last_observed_at=captured_at,
-                          last_error=None, failures=0, notification_error=None)
+                          last_error=None, failures=0)
         comment = reply['comment']
         # Exact delivery duplicate guard; semantic decision remains with the model.
         duplicate = bool(comment and self.history and comment == self.history[-1]['text'])
@@ -308,12 +332,7 @@ class Worker:
             self.history.append({'time': now(), 'text': comment})
             self.state['last_comment'] = comment
             if not self.args.no_notify:
-                try:
-                    self.notify(comment)
-                except InterruptedError:
-                    raise
-                except RuntimeError as error:
-                    self.state['notification_error'] = str(error)
+                self.notify(comment)
             self.state['comments'] += 1
         self.state['cycles'] += 1
         self.state['speaking_pace'] = self.pacer.snapshot()
@@ -326,7 +345,9 @@ class Worker:
                     'usage': self.state.get('usage'),
                     'suppression': suppression, 'speaking_pace': self.state['speaking_pace'],
                     'capture_ms': capture_ms, 'model_ms': model_ms, 'total_ms': elapsed_ms,
-                    'notification_error': self.state['notification_error']})
+                    'notification_error': self.state['notification_error'],
+                    'speech_error': self.state['speech_error'],
+                    'speech_enabled': self.state['speech_enabled']})
         self.save()
         return dict(reply, comment=comment if suppression is None else '',
                     suppression=suppression)
@@ -406,9 +427,11 @@ def start(args, home):
                 '--display', str(args.display), '--model', args.model,
                 '--openclaw', args.openclaw, '--timeout', str(args.timeout),
                 '--agent', args.agent, '--session-key', args.session_key,
-                '--workspace', str(args.workspace)]
+                '--workspace', str(args.workspace), '--voice', args.voice]
         if args.no_notify:
             argv.append('--no-notify')
+        if args.no_speech:
+            argv.append('--no-speech')
         # OpenClaw owns persistent conversation history; local observation state resets.
         log = home / 'worker.log'
         if log.exists():
@@ -478,6 +501,8 @@ def main():
         cmd.add_argument('--openclaw', default=shutil.which('openclaw') or 'openclaw')
         cmd.add_argument('--timeout', type=int, default=120)
         cmd.add_argument('--no-notify', action='store_true')
+        cmd.add_argument('--no-speech', action='store_true', help='Show notifications without reading them aloud')
+        cmd.add_argument('--voice', default=DEFAULT_VOICE, help='macOS say voice (default: Tingting)')
     commands.add_parser('status')
     commands.add_parser('stop')
     ctx = commands.add_parser('context')
@@ -487,7 +512,9 @@ def main():
     source.add_argument('--text')
     source.add_argument('--file', help='UTF-8 file, or - for stdin')
     notify = commands.add_parser('notify-test')
-    notify.add_argument('--text', default='Kibitz 通知链路测试：小爪来插一句。')
+    notify.add_argument('--text', default='Kibitz 通知与语音测试：小爪来插一句。')
+    notify.add_argument('--no-speech', action='store_true')
+    notify.add_argument('--voice', default=DEFAULT_VOICE)
     args = parser.parse_args()
     home = args.home.expanduser().resolve()
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -531,9 +558,13 @@ def main():
     elif args.command == 'status':
         result = status(home)
     elif args.command == 'notify-test':
-        subprocess.run(notification_command(args.text), check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        result = {'submitted': True, 'note': 'macOS notification visibility depends on notification permissions and Focus mode'}
+        def run_channel(argv, timeout):
+            subprocess.run(argv, check=True, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=timeout)
+        errors = present_comment(args.text, run_channel, no_speech=args.no_speech, voice=args.voice)
+        result = dict(errors, notification_submitted=errors['notification_error'] is None,
+                      speech_completed=not args.no_speech and errors['speech_error'] is None,
+                      voice=args.voice)
     else:
         Worker(args, home).run(once=args.command == 'once', initialize=args.command == 'init')
         return

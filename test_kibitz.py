@@ -6,7 +6,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import threading
+import time
 from copy import deepcopy
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).parent / 'skills/kibitz/scripts/kibitz.py'
 sys.path.insert(0, str(SCRIPT.parent))
@@ -45,6 +48,7 @@ def request_payload(argv):
 def options(**changes):
     values = dict(model='test/vision', interval=5, frames=2,
                   display=1, openclaw='openclaw', timeout=10, no_notify=False,
+                  no_speech=False, voice='Tingting',
                   agent='main', session_key='kibitz', workspace=TEST_WORKSPACE)
     values.update(changes)
     return argparse.Namespace(**values)
@@ -69,7 +73,7 @@ class CompanionTests(unittest.TestCase):
                             envelope('发现新区域', '这地方有点意思。'),
                             envelope('还在同一区域', '这地方有点意思。'),
                             envelope('正在浏览', ''), envelope('切换活动', '换个口味了。')])
-            prompts, frames, notices = [], [], []
+            prompts, frames, notices, speeches = [], [], [], []
 
             def command(argv, timeout=60):
                 if argv[0].endswith('screencapture'):
@@ -77,6 +81,9 @@ class CompanionTests(unittest.TestCase):
                     return ''
                 if argv[0].endswith('osascript'):
                     notices.append(argv[-2])
+                    return ''
+                if argv[0].endswith('/say'):
+                    speeches.append(argv[-1])
                     return ''
                 text, payload = request_payload(argv)
                 prompts.append(text)
@@ -95,6 +102,7 @@ class CompanionTests(unittest.TestCase):
             self.assertEqual(frames, [1, 2, 2, 2, 2])
             self.assertEqual(len(list(home.glob('*.jpg'))), 2)
             self.assertEqual(notices, ['这地方有点意思。', '换个口味了。'])
+            self.assertEqual(speeches, notices)
             self.assertIn('发现新区域', prompts[2])
             self.assertIn('先让我安静看一会', prompts[3])
             self.assertEqual(worker.state['cycles'], 5)
@@ -145,7 +153,7 @@ class CompanionTests(unittest.TestCase):
                             envelope(comment='不能刷屏', interest='high'),
                             envelope(comment='画面没变也不能说', changed=False, interest='high'),
                             envelope(comment='低兴趣不说', interest='low')])
-            notices, prompts, reasons = [], [], []
+            notices, prompts, reasons, speeches = [], [], [], []
 
             def command(argv, timeout=60):
                 if argv[0].endswith('screencapture'):
@@ -153,6 +161,9 @@ class CompanionTests(unittest.TestCase):
                     return ''
                 if argv[0].endswith('osascript'):
                     notices.append(argv[-2])
+                    return ''
+                if argv[0].endswith('/say'):
+                    speeches.append(argv[-1])
                     return ''
                 prompts.append(request_payload(argv)[0])
                 return next(replies)
@@ -162,6 +173,7 @@ class CompanionTests(unittest.TestCase):
                 moment[0] = seconds
                 reasons.append(worker.cycle(home)['suppression'])
             self.assertEqual(notices, ['有趣的新事件一', '有趣的新事件二'])
+            self.assertEqual(speeches, notices)
             self.assertEqual(reasons, ['first_observation', None, None, 'speech_budget',
                                       'unchanged_screen', 'low_interest'])
             self.assertIn('"comments_last_60s": 2', prompts[3])
@@ -194,6 +206,77 @@ class CompanionTests(unittest.TestCase):
         argv = kibitz.notification_command(text)
         self.assertEqual(argv[-2], text)
         self.assertNotIn(text, argv[1:-2])
+        spoken = kibitz.speech_command(text)
+        self.assertEqual(spoken[-2:], ['--', text])
+
+    def test_same_comment_notification_and_speech_with_mute_option(self):
+        text = '-v anything; $(touch /tmp/not-allowed)'
+        calls = []
+        def runner(argv, timeout):
+            calls.append(argv)
+        result = kibitz.present_comment(text, runner, voice='Meijia')
+        self.assertEqual(calls[0][-2], text)
+        self.assertEqual(calls[1], ['/usr/bin/say', '-v', 'Meijia', '--', text])
+        self.assertIsNone(result['notification_error'])
+        self.assertIsNone(result['speech_error'])
+        calls.clear()
+        kibitz.present_comment(text, runner, no_speech=True)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][0].endswith('osascript'))
+
+    def test_channel_failures_are_independent(self):
+        calls = []
+        def notification_fails(argv, timeout):
+            calls.append(argv[0])
+            if argv[0].endswith('osascript'):
+                raise RuntimeError('notification unavailable')
+        result = kibitz.present_comment('一条评论', notification_fails)
+        self.assertEqual(calls, ['/usr/bin/osascript', '/usr/bin/say'])
+        self.assertEqual(result['notification_error'], 'notification unavailable')
+        self.assertIsNone(result['speech_error'])
+        def speech_fails(argv, timeout):
+            if argv[0].endswith('/say'):
+                raise RuntimeError('voice unavailable')
+        result = kibitz.present_comment('一条评论', speech_fails)
+        self.assertIsNone(result['notification_error'])
+        self.assertEqual(result['speech_error'], 'voice unavailable')
+
+    def test_stop_interrupts_speech_without_finishing_or_queueing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worker = kibitz.Worker(options(), Path(directory))
+            def runner(argv, timeout):
+                if argv[0].endswith('osascript'):
+                    return ''
+                return worker.command(argv, timeout=timeout)
+            timer = threading.Timer(0.15, worker.stop)
+            timer.start()
+            started = time.monotonic()
+            try:
+                with patch.object(kibitz, 'speech_command', return_value=[
+                        sys.executable, '-c', 'import time; time.sleep(30)']):
+                    with self.assertRaises(InterruptedError):
+                        kibitz.present_comment('播报中停止', runner)
+            finally:
+                timer.cancel()
+                timer.join()
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertIsNone(worker.child)
+
+    def test_no_notify_also_disables_speech(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            worker = kibitz.Worker(options(no_notify=True), home)
+            def command(argv, timeout=60):
+                if argv[0].endswith('screencapture'):
+                    Path(argv[-1]).write_bytes(b'fake-image')
+                    return ''
+                if argv[0].endswith(('/say', 'osascript')):
+                    self.fail('Dry observation must not notify or speak')
+                return envelope(comment='候选评论')
+            worker.command = command
+            worker.cycle(home)
+            worker.cycle(home)
+            self.assertFalse(worker.state['speech_enabled'])
 
     def test_context_input_and_stopped_state(self):
         with tempfile.TemporaryDirectory() as directory:
